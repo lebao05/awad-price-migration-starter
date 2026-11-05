@@ -1,15 +1,15 @@
 import { createServer } from 'node:http';
 
-// v3 of the menu service: SWITCH THE READ PATH.
+// v4 of the menu service: CONTRACT.
 //
-// Nothing about the schema or the write paths changes from v2: every write still
-// fills both `price` (thousands, REAL) and `price_vnd` (dong, INTEGER), which is
-// why rolling back to v2 stays safe. What changes is the read: `price_vnd` is now
-// the column of record, and `price` is only a fallback for rows the backfill has
-// not reached yet.
+// This version never names `menu_items.price` — not in a SELECT, not in an
+// INSERT, not in an UPDATE. That is what makes dropping the column (migration
+// 003) safe while v4 keeps serving. `price_vnd` (dong, INTEGER) is the only
+// source of truth.
 //
-// The API is unchanged: old clients still get `price` (derived, = price_vnd /
-// 1000) and new clients still get `priceVnd`.
+// The HTTP contract is unchanged: old clients still send and receive `price`
+// (thousands of dong), new clients send and receive `priceVnd` (dong). `price`
+// is derived on the way out, `price_vnd` on the way in.
 
 const json = (res, status, body) => {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -29,38 +29,33 @@ const isPriceVnd = (v) => Number.isInteger(v) && v > 0 && v <= 100000000;
 const toVnd = (price) => Math.round(price * 1000);
 const toThousands = (vnd) => vnd / 1000;
 
-// Read path: the new column first, the old one only while it is still NULL.
-const priceOf = (row) => (row.price_vnd === null ? row.price : toThousands(row.price_vnd));
-const vndOf = (row) => (row.price_vnd === null ? toVnd(row.price) : row.price_vnd);
-
-// One input, two columns. A client sends either `price` (old) or `priceVnd`
-// (new), never both, and the pair written to the database is always consistent.
+// One numeric input, one stored value. `price` is the old unit, `priceVnd` the
+// new one; both are stored as the integer dong value of the same price.
 function parsePrice(body) {
   if (!body || typeof body !== 'object') return null;
   const hasPrice = body.price !== undefined;
   const hasVnd = body.priceVnd !== undefined;
   if (hasPrice === hasVnd) return null;
-  if (hasPrice) return isPrice(body.price) ? { price: body.price, vnd: toVnd(body.price) } : null;
-  return isPriceVnd(body.priceVnd) ? { price: toThousands(body.priceVnd), vnd: body.priceVnd } : null;
+  if (hasPrice) return isPrice(body.price) ? toVnd(body.price) : null;
+  return isPriceVnd(body.priceVnd) ? body.priceVnd : null;
 }
 
 export function createApp(db) {
   const q = {
-    list: db.prepare('SELECT id, name, price, price_vnd FROM menu_items ORDER BY id LIMIT ? OFFSET ?'),
-    get: db.prepare('SELECT id, name, price, price_vnd FROM menu_items WHERE id = ?'),
-    insert: db.prepare('INSERT INTO menu_items (name, price, price_vnd) VALUES (?, ?, ?)'),
-    setPrice: db.prepare('UPDATE menu_items SET price = ?, price_vnd = ? WHERE id = ?'),
+    list: db.prepare('SELECT id, name, price_vnd FROM menu_items ORDER BY id LIMIT ? OFFSET ?'),
+    get: db.prepare('SELECT id, name, price_vnd FROM menu_items WHERE id = ?'),
+    insert: db.prepare('INSERT INTO menu_items (name, price_vnd) VALUES (?, ?)'),
+    setPrice: db.prepare('UPDATE menu_items SET price_vnd = ? WHERE id = ?'),
     insertOrder: db.prepare("INSERT INTO orders (created_at) VALUES (datetime('now'))"),
     insertLine: db.prepare('INSERT INTO order_items (order_id, menu_item_id, qty, unit_price) VALUES (?, ?, ?, ?)'),
   };
 
-  // `price_vnd` is the column of record in v3; `price` is only the fallback for
-  // a row the backfill has not reached, so neither response field can be null.
+  // Old clients keep reading `price` in thousands; it is computed, never stored.
   const view = (row) => ({
     id: row.id,
     name: row.name,
-    price: priceOf(row),
-    priceVnd: vndOf(row),
+    price: toThousands(row.price_vnd),
+    priceVnd: row.price_vnd,
   });
 
   async function handle(req, res) {
@@ -77,10 +72,10 @@ export function createApp(db) {
       }
       if (req.method === 'POST') {
         const body = await readBody(req);
-        const p = parsePrice(body);
-        if (!p || typeof body.name !== 'string' || !body.name)
+        const vnd = parsePrice(body);
+        if (vnd === null || typeof body.name !== 'string' || !body.name)
           return error(res, 400, 'invalid_body', 'name (string) and price (thousands of dong) or priceVnd (dong) are required');
-        const { lastInsertRowid } = q.insert.run(body.name, p.price, p.vnd);
+        const { lastInsertRowid } = q.insert.run(body.name, vnd);
         return json(res, 201, view(q.get.get(lastInsertRowid)));
       }
     }
@@ -92,9 +87,9 @@ export function createApp(db) {
       if (req.method === 'GET') return json(res, 200, view(row));
       if (req.method === 'PATCH') {
         const body = await readBody(req);
-        const p = parsePrice(body);
-        if (!p) return error(res, 400, 'invalid_body', 'price (thousands of dong) or priceVnd (dong) is required');
-        q.setPrice.run(p.price, p.vnd, id);
+        const vnd = parsePrice(body);
+        if (vnd === null) return error(res, 400, 'invalid_body', 'price (thousands of dong) or priceVnd (dong) is required');
+        q.setPrice.run(vnd, id);
         return json(res, 200, view(q.get.get(id)));
       }
     }
@@ -111,8 +106,9 @@ export function createApp(db) {
           const item = q.get.get(menuItemId);
           if (!item || !Number.isInteger(qty) || qty < 1) throw Object.assign(new Error(), { status: 400 });
           // order_items.unit_price keeps its old unit (thousands) and is not migrated
-          q.insertLine.run(orderId, item.id, qty, priceOf(item));
-          total += priceOf(item) * qty;
+          const price = toThousands(item.price_vnd);
+          q.insertLine.run(orderId, item.id, qty, price);
+          total += price * qty;
         }
         db.exec('COMMIT');
         return json(res, 201, { id: Number(orderId), total: Math.round(total * 1000) / 1000 });
