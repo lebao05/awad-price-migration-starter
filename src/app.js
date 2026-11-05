@@ -1,14 +1,15 @@
 import { createServer } from 'node:http';
 
-// v2 of the menu service: EXPAND + DUAL WRITE.
+// v3 of the menu service: SWITCH THE READ PATH.
 //
-// `menu_items.price` (thousands of dong, REAL) still exists and is still the
-// column this version reads, because v1 instances are gone but rows written
-// before the backfill have no `price_vnd` yet. Every write path now writes BOTH
-// columns, so whichever version takes the next write, both columns stay right.
-// The API returns `price` (thousands) for old clients and `priceVnd` (dong) for
-// new ones; for a row that v1 wrote, `priceVnd` is derived from `price` rather
-// than returned as null.
+// Nothing about the schema or the write paths changes from v2: every write still
+// fills both `price` (thousands, REAL) and `price_vnd` (dong, INTEGER), which is
+// why rolling back to v2 stays safe. What changes is the read: `price_vnd` is now
+// the column of record, and `price` is only a fallback for rows the backfill has
+// not reached yet.
+//
+// The API is unchanged: old clients still get `price` (derived, = price_vnd /
+// 1000) and new clients still get `priceVnd`.
 
 const json = (res, status, body) => {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -27,6 +28,10 @@ const isPrice = (p) => typeof p === 'number' && Number.isFinite(p) && p > 0 && p
 const isPriceVnd = (v) => Number.isInteger(v) && v > 0 && v <= 100000000;
 const toVnd = (price) => Math.round(price * 1000);
 const toThousands = (vnd) => vnd / 1000;
+
+// Read path: the new column first, the old one only while it is still NULL.
+const priceOf = (row) => (row.price_vnd === null ? row.price : toThousands(row.price_vnd));
+const vndOf = (row) => (row.price_vnd === null ? toVnd(row.price) : row.price_vnd);
 
 // One input, two columns. A client sends either `price` (old) or `priceVnd`
 // (new), never both, and the pair written to the database is always consistent.
@@ -49,13 +54,13 @@ export function createApp(db) {
     insertLine: db.prepare('INSERT INTO order_items (order_id, menu_item_id, qty, unit_price) VALUES (?, ?, ?, ?)'),
   };
 
-  // `price` is the read path in v2. `price_vnd` may still be NULL for a row that
-  // v1 wrote, so the new field is derived instead of served as null.
+  // `price_vnd` is the column of record in v3; `price` is only the fallback for
+  // a row the backfill has not reached, so neither response field can be null.
   const view = (row) => ({
     id: row.id,
     name: row.name,
-    price: row.price,
-    priceVnd: row.price_vnd ?? toVnd(row.price),
+    price: priceOf(row),
+    priceVnd: vndOf(row),
   });
 
   async function handle(req, res) {
@@ -106,8 +111,8 @@ export function createApp(db) {
           const item = q.get.get(menuItemId);
           if (!item || !Number.isInteger(qty) || qty < 1) throw Object.assign(new Error(), { status: 400 });
           // order_items.unit_price keeps its old unit (thousands) and is not migrated
-          q.insertLine.run(orderId, item.id, qty, item.price);
-          total += item.price * qty;
+          q.insertLine.run(orderId, item.id, qty, priceOf(item));
+          total += priceOf(item) * qty;
         }
         db.exec('COMMIT');
         return json(res, 201, { id: Number(orderId), total: Math.round(total * 1000) / 1000 });

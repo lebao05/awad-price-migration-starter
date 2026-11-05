@@ -4,9 +4,9 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { open } from '../src/db.js';
 import { createApp } from '../src/app.js';
 
-let server, base;
+let server, base, db;
 before(async () => {
-  const db = open(':memory:');
+  db = open(':memory:');
   const dir = new URL('../migrations/', import.meta.url);
   for (const f of readdirSync(dir).filter((f) => f.endsWith('.up.sql')).sort())
     db.exec(readFileSync(new URL(f, dir), 'utf8'));          // every migration, in order
@@ -36,6 +36,15 @@ test('a row v1 wrote (price_vnd NULL) still serves a derived priceVnd', async ()
   assert.equal(r.status, 200);
   assert.equal(r.body.price, 60);
   assert.equal(r.body.priceVnd, 60000);
+});
+
+test('the new column is the read path: a stale price does not leak out', async () => {
+  db.exec("INSERT INTO menu_items (name, price, price_vnd) VALUES ('Gỏi cuốn', 10, 99999)");
+  const r = await call('GET', '/menu/4');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.priceVnd, 99999);
+  assert.equal(r.body.price, 99.999);
+  db.exec("DELETE FROM menu_items WHERE name = 'Gỏi cuốn'");
 });
 
 test('PATCH with price writes both columns', async () => {
