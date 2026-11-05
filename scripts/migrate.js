@@ -3,9 +3,12 @@
 // `up` applies every pending step; `down` reverts the LAST applied step only.
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { open, DB_PATH } from '../src/db.js';
 
-const DIR = new URL('../migrations/', import.meta.url).pathname;
+// fileURLToPath, not URL.pathname: on Windows pathname is "/D:/..." and the
+// leading slash makes readdirSync resolve it against the current drive.
+const DIR = fileURLToPath(new URL('../migrations/', import.meta.url));
 const db = open();
 db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)');
 

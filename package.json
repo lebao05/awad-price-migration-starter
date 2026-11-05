@@ -11,6 +11,7 @@
     "migrate:down": "node scripts/migrate.js down",
     "migrate:status": "node scripts/migrate.js status",
     "seed": "node scripts/seed.js",
+    "backfill": "node scripts/backfill.js",
     "traffic": "node scripts/traffic.js",
     "check": "node scripts/check.js",
     "test": "node --test --test-reporter=spec"
